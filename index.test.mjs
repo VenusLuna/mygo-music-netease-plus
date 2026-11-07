@@ -282,7 +282,9 @@ test("guests can discover entries but private recommendations ask for sign-in", 
   const { plugin } = await setup(async () => { calls++; return response({ code: 200, result: [] }); });
   const home = await plugin.home();
   assert.ok(home.sections.some(section => section.links?.some(link => link.page === "daily")));
-  assert.equal((await plugin.stations()).length, 3);
+  const stations = await plugin.stations();
+  assert.equal(stations.length, 3);
+  assert.ok(stations.every(station => station.description.includes("个性化服务")));
   for (const page of ["daily", "radar", "recommendations"]) await assert.rejects(plugin.browse({ page }), { code: "signIn" });
   await assert.rejects(plugin.stationNext({ id: "DEFAULT" }), { code: "signIn" });
   assert.equal(calls, 1);
@@ -322,4 +324,74 @@ test("daily, radar, personalized playlists and continuous FM map to host capabil
   }
   assert.deepEqual(modes, ["DEFAULT", "FAMILIAR", "EXPLORE", "DEFAULT"]);
   await assert.rejects(plugin.stationNext({ id: "unknown" }), { code: "unsupported" });
+});
+
+test("disabled personalization explains an empty radio batch and permits recovery", async () => {
+  for (const mode of ["DEFAULT", "FAMILIAR", "EXPLORE"]) {
+    let radioCalls = 0;
+    let detailCalls = 0;
+    let settingsCalls = 0;
+    const { plugin } = await setup(async (url, init) => {
+      if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+      if (url.includes("/user/setting")) {
+        settingsCalls++;
+        assert.match(init.headers.Cookie, /MUSIC_U=synthetic-session/);
+        return response({ code: 200, setting: { personalServiceSetting: 2 } });
+      }
+      const { path, data } = decode(init.body);
+      if (path === "/api/v1/radio/get") {
+        assert.equal(data.mode, mode);
+        radioCalls++;
+        return response({ code: 200, data: radioCalls === 1 ? [] : [song(1)] });
+      }
+      assert.equal(path, "/api/v3/song/detail");
+      detailCalls++;
+      return response({ code: 200, songs: [song(1)], privileges: [{ id: 1, st: 0, pl: 320000 }] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+    await assert.rejects(plugin.stationNext({ id: mode }), error => {
+      assert.equal(error.code, "unavailable");
+      assert.match(error.message, /个性化服务/);
+      return true;
+    });
+    assert.equal(radioCalls, 1);
+    assert.equal(detailCalls, 0);
+    assert.equal(settingsCalls, 1);
+    assert.notEqual(await plugin.account(), null);
+    assert.deepEqual((await plugin.stationNext({ id: mode })).map(track => track.id), ["1"]);
+    assert.equal(radioCalls, 2);
+    assert.equal(detailCalls, 1);
+    assert.equal(settingsCalls, 1);
+  }
+});
+
+test("other empty radio batches remain retryable when the setting is enabled or unknown", async () => {
+  for (const preferences of [
+    { code: 200, setting: { personalServiceSetting: 0 } },
+    { code: 200, setting: {} },
+    { code: 500 },
+  ]) {
+    const { plugin } = await setup(async (url, init) => {
+      if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+      if (url.includes("/user/setting")) return response(preferences);
+      assert.equal(decode(init.body).path, "/api/v1/radio/get");
+      return response({ code: 200, data: [] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    assert.deepEqual(await plugin.stationNext({ id: "DEFAULT" }), []);
+    assert.notEqual(await plugin.account(), null);
+  }
+});
+
+test("radio and diagnostic authentication failures keep their sign-in error", async () => {
+  for (const failingEndpoint of ["radio", "settings"]) {
+    const { plugin } = await setup(async (url, init) => {
+      if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+      if (url.includes("/user/setting")) return response({ code: 301 });
+      assert.equal(decode(init.body).path, "/api/v1/radio/get");
+      return response(failingEndpoint === "radio" ? { code: 301 } : { code: 200, data: [] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+    await assert.rejects(plugin.stationNext({ id: "DEFAULT" }), { code: "signIn" });
+    assert.equal(await plugin.account(), null);
+  }
 });

@@ -739,7 +739,13 @@ function stationList() {
     { id: "DEFAULT", name: "私人漫游", description: "随心听，持续推荐你可能喜欢的歌曲" },
     { id: "FAMILIAR", name: "熟悉的歌", description: "回到熟悉的旋律" },
     { id: "EXPLORE", name: "新发现", description: "探索还没听过的音乐" },
-  ].map((station, index) => ({ ...station, imageUrl: discoveryCover(index + 3) }));
+  ].map((station, index) => ({
+    ...station,
+    // Older hosts replace source errors with a generic toast, so keep the
+    // prerequisite visible on the station card as well.
+    description: `${station.description}。需在网易云 App 中开启「个性化服务」。`,
+    imageUrl: discoveryCover(index + 3),
+  }));
 }
 
 export async function stations() {
@@ -852,5 +858,19 @@ export async function stationNext({ id }) {
   await requireAccount();
   const data = await eapi("/api/v1/radio/get", { mode: id, limit: 3 });
   const songs = data.data || [];
+  if (songs.length === 0) {
+    let personalizationDisabled = false;
+    try {
+      const preferences = await request("/api/user/setting", {}, { keepSession: true });
+      personalizationDisabled = preferences.setting?.personalServiceSetting === 2;
+    } catch (error) {
+      // A diagnostic lookup must not turn a transient empty batch into a new
+      // failure, but an expired session still needs the normal sign-in flow.
+      if (error.code === "signIn") throw error;
+    }
+    if (personalizationDisabled) {
+      throw fail("unavailable", "网易云的「个性化服务」已关闭。请在官方 App 的「设置 → 消息和隐私 → 个性化服务」中开启后重试。");
+    }
+  }
   return (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
 }
