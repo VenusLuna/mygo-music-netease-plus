@@ -226,6 +226,7 @@ function toPlaylist(playlist) {
     imageUrl: secureURL(playlist.coverImgUrl || playlist.picUrl),
     description: playlist.description || "", owner: playlist.creator?.nickname || "",
     trackCount: playlist.trackCount || 0, saved: !!playlist.subscribed,
+    fixed: Number(playlist.specialType) === 5,
     mine: !!session?.profile && String(playlist.creator?.userId) === session.profile.id,
   };
 }

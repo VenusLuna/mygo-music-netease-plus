@@ -323,3 +323,31 @@ test("daily, radar, personalized playlists and continuous FM map to host capabil
   assert.deepEqual(modes, ["DEFAULT", "FAMILIAR", "EXPLORE", "DEFAULT"]);
   await assert.rejects(plugin.stationNext({ id: "unknown" }), { code: "unsupported" });
 });
+
+// The host must recognize NetEase's built-in liked playlist without losing ownership.
+test("fixed playlist mapping preserves ownership across lists and detail", async () => {
+  const fixtures = [
+    { id: 21, specialType: 5, creator: { userId: 7 }, expectedFixed: true, expectedMine: true },
+    { id: 22, specialType: "5", creator: { userId: 8 }, subscribed: true, expectedFixed: true, expectedMine: false },
+    { id: 23, specialType: 0, creator: { userId: 7 }, expectedFixed: false, expectedMine: true },
+    { id: 24, creator: { userId: 8 }, subscribed: true, expectedFixed: false, expectedMine: false },
+  ];
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("user/playlist")) return response({ code: 200, playlist: fixtures, more: false });
+    if (url.includes("playlist/detail")) {
+      const id = Number(new URL(url).searchParams.get("id"));
+      return response({ code: 200, playlist: { ...fixtures.find(p => p.id === id), trackIds: [] } });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  const lists = await plugin.playlists();
+  assert.equal(lists.length, fixtures.length);
+  for (const [i, source] of fixtures.entries()) {
+    for (const mapped of [lists[i], await plugin.playlist({ id: String(source.id) })]) {
+      assert.equal(mapped.fixed, source.expectedFixed, `fixed for ${source.id}`);
+      assert.equal(mapped.mine, source.expectedMine, `mine for ${source.id}`);
+      assert.equal(mapped.saved, !!source.subscribed, `saved for ${source.id}`);
+    }
+  }
+});
