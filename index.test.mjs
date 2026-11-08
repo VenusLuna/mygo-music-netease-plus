@@ -38,6 +38,87 @@ function decode(body) {
 
 const song = (id) => ({ id, name: `Song ${id}`, ar: [{ id: 5, name: "Artist" }], al: { id: 6, name: "Album" }, dt: 180000, fee: 1 });
 
+// Each public search mapping must expose a template, not the full original or
+// a fixed small picture that would also be used in Now Playing.
+test("search provides sized artwork for tracks, albums, artists, playlists and shows", async () => {
+  const picture = "http://p1.music.126.net/fixture.jpg";
+  const track = { ...song(1), al: { id: 6, picUrl: picture }, ar: [{ id: 5, img1v1Url: picture }] };
+  for (const [kind, key, item] of [
+    ["tracks", "songs", track], ["albums", "albums", { id: 6, picUrl: picture }],
+    ["artists", "artists", { id: 5, img1v1Url: picture }],
+    ["playlists", "playlists", { id: 9, coverImgUrl: picture }],
+    ["shows", "djRadios", { id: 8, picUrl: picture }],
+  ]) {
+    const { plugin } = await setup(async (url) => url.includes("cloudsearch")
+      ? response({ code: 200, result: { [key]: [item] } })
+      : response({ code: 200, songs: [track], privileges: [] }));
+    const record = (await plugin.search({ query: "fixture", kind }))[kind][0];
+    const images = kind === "tracks" ? [record.album.imageUrl, record.artists[0].imageUrl] : [record.imageUrl];
+    for (const image of images) {
+      const url = new URL(image);
+      assert.equal(url.protocol, "https:", kind);
+      assert.equal(url.searchParams.get("param"), "{size}y{size}", kind);
+    }
+  }
+});
+
+// Only the image CDN understands param; existing query values, fragments and
+// non-CDN URLs must survive without redirecting their requests to another host.
+test("artwork templates preserve query values and leave other URLs alone", async () => {
+  const source = "https://p12.music.126.net/cover.jpg?quality=90&param=200y200&version=v2&param=800y800&label=a%20b&token=a%2Fb#cover";
+  const unchanged = [
+    "https://images.example/cover.jpg?param=200y200",
+    "https://p1.music.126.net.example/cover.jpg",
+    "https://m1.music.126.net/cover.jpg",
+    "https://p1.music.126.net:8443/cover.jpg",
+    "https://user:password@p1.music.126.net/cover.jpg",
+    "file:///tmp/cover.jpg", "data:image/png;base64,fixture", "not a URL",
+  ];
+  const { plugin } = await setup(async () => response({ code: 200, result: {
+    albums: [source, ...unchanged, "http://images.example/cover.jpg", "", null].map((picUrl, id) => ({ id, picUrl })),
+  } }));
+  const albums = (await plugin.search({ query: "fixture", kind: "albums" })).albums;
+  const url = new URL(albums[0].imageUrl);
+  assert.deepEqual(url.searchParams.getAll("param"), ["{size}y{size}"]);
+  assert.equal(url.searchParams.get("quality"), "90");
+  assert.equal(url.searchParams.get("version"), "v2");
+  assert.equal(url.searchParams.get("label"), "a b");
+  assert.equal(url.searchParams.get("token"), "a/b");
+  assert.equal(url.hash, "#cover");
+  assert.deepEqual(albums.slice(1, 1 + unchanged.length).map(album => album.imageUrl), unchanged);
+  assert.deepEqual(albums.slice(-3).map(album => album.imageUrl), ["https://images.example/cover.jpg", "", ""]);
+});
+
+// Podcast episodes can have their own cover or fall back to their show; both
+// routes need the same size contract as albums and playlist artwork.
+test("podcast covers and episode fallbacks use sized artwork", async () => {
+  const showPicture = "https://p2.music.126.net/show.jpg";
+  const episodePicture = "https://p3.music.126.net/episode.jpg";
+  const { plugin } = await setup(async (url) => url.includes("djradio/v2/get")
+    ? response({ code: 200, data: { id: 8, picUrl: showPicture } })
+    : response({ code: 200, programs: [
+      { id: 1, coverUrl: episodePicture, mainSong: { id: 11 } },
+      { id: 2, mainSong: { id: 12 } },
+    ] }));
+  const page = await plugin.show({ id: "8" });
+  const covers = [page.show.imageUrl, ...page.episodes.map(episode => episode.album.imageUrl)];
+  assert.deepEqual(covers.map(cover => new URL(cover).pathname), ["/show.jpg", "/episode.jpg", "/show.jpg"]);
+  assert.ok(covers.every(cover => new URL(cover).searchParams.get("param") === "{size}y{size}"));
+});
+
+// Account and comment avatars pass through the host's image loader too.
+test("account and comment avatars use the same artwork size contract", async () => {
+  const picture = "https://p4.music.126.net/avatar.jpg";
+  const { plugin } = await setup(async (url) => url.includes("account/get")
+    ? response({ code: 200, profile: { userId: 8, nickname: "Fixture", avatarUrl: picture } })
+    : response({ code: 200, comments: [{ commentId: 9, user: { nickname: "Fixture", avatarUrl: picture } }] }),
+  { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const account = await plugin.account();
+  const page = await plugin.comments({ trackId: "1" });
+  assert.equal(new URL(account.imageUrl).searchParams.get("param"), "{size}y{size}");
+  assert.equal(new URL(page.comments[0].avatarUrl).searchParams.get("param"), "{size}y{size}");
+});
+
 // MyGo 0.1.6 holds its mutex while importing: top-level storage calls deadlock.
 test("module initialization defers host storage until an action", async () => {
   const { plugin, storageReads } = await setup(async () => response({ code: 200 }));
@@ -89,10 +170,10 @@ test("stream maps quality and keeps the session away from the CDN", async () => 
     const { data } = decode(init.body);
     assert.equal(data.level, "exhigh");
     assert.equal(data.header.MUSIC_U, "synthetic-session");
-    return response({ code: 200, data: [{ id: 1, code: 200, url: "http://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh", size: 100, freeTrialInfo: null }] });
+    return response({ code: 200, data: [{ id: 1, code: 200, url: "http://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123", type: "mp3", level: "exhigh", size: 100, freeTrialInfo: null }] });
   }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
   const audio = await plugin.stream({ id: "1", quality: "high" });
-  assert.equal(audio.url, "https://m1.music.126.net/song.mp3");
+  assert.equal(audio.url, "https://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123");
   assert.equal(audio.quality, "high");
   assert.equal(audio.headers.Cookie, undefined);
 });

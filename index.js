@@ -52,6 +52,25 @@ function secureURL(value) {
   return typeof value === "string" ? value.replace(/^http:\/\//, "https://") : "";
 }
 
+// MyGo Music 0.1.20+ replaces {size} (including URL-encoded braces) with the
+// pixels needed by each view. Ask NetEase's image CDN to resize before the
+// download, instead of fetching and decoding an original for a small row.
+function artworkURL(value) {
+  const picture = secureURL(value);
+  if (!picture) return "";
+  try {
+    const url = new URL(picture);
+    if (url.protocol !== "https:" || !/^p\d+\.music\.126\.net$/.test(url.hostname) ||
+        url.port || url.username || url.password) return picture;
+    // Set just the resize parameter, preserving other query values and the
+    // fragment. Audio and external image services keep their original URLs.
+    url.searchParams.set("param", "{size}y{size}");
+    return url.toString();
+  } catch {
+    return picture;
+  }
+}
+
 function deviceID() {
   let id = host.storage.get("deviceId");
   if (!id) {
@@ -197,13 +216,13 @@ async function request(path, params = {}, options = {}) {
 const eapi = (path, params, options = {}) => request(path, params, { ...options, eapi: true });
 
 function toArtist(artist = {}) {
-  return { id: String(artist.id || ""), name: artist.name || "", imageUrl: secureURL(artist.img1v1Url || artist.picUrl) };
+  return { id: String(artist.id || ""), name: artist.name || "", imageUrl: artworkURL(artist.img1v1Url || artist.picUrl) };
 }
 
 function toAlbum(album = {}) {
   const date = Number(album.publishTime);
   return {
-    id: String(album.id || ""), name: album.name || "", imageUrl: secureURL(album.picUrl),
+    id: String(album.id || ""), name: album.name || "", imageUrl: artworkURL(album.picUrl),
     artists: (album.artists || (album.artist ? [album.artist] : [])).map(toArtist),
     released: date > 0 ? new Date(date).toISOString().slice(0, 10) : "",
   };
@@ -223,7 +242,7 @@ function toTrack(track) {
 function toPlaylist(playlist) {
   return {
     id: String(playlist.id), name: playlist.name || "",
-    imageUrl: secureURL(playlist.coverImgUrl || playlist.picUrl),
+    imageUrl: artworkURL(playlist.coverImgUrl || playlist.picUrl),
     description: playlist.description || "", owner: playlist.creator?.nickname || "",
     trackCount: playlist.trackCount || 0, saved: !!playlist.subscribed,
     fixed: Number(playlist.specialType) === 5,
@@ -233,7 +252,7 @@ function toPlaylist(playlist) {
 
 function toShow(show) {
   return {
-    id: String(show.id), name: show.name || "", imageUrl: secureURL(show.picUrl),
+    id: String(show.id), name: show.name || "", imageUrl: artworkURL(show.picUrl),
     description: show.desc || "", publisher: show.dj?.nickname || "",
     episodeCount: show.programCount || 0, subscribed: !!show.subed,
   };
@@ -249,7 +268,7 @@ function toEpisode(program, show) {
     id: `program:${programID}${audioID ? ":" + audioID : ""}`,
     name: program.name || "", showId: String(show.id),
     artists: show.dj?.nickname ? [{ id: "", name: show.dj.nickname }] : [],
-    album: { id: "", name: show.name || "", imageUrl: secureURL(program.coverUrl || show.picUrl) },
+    album: { id: "", name: show.name || "", imageUrl: artworkURL(program.coverUrl || show.picUrl) },
     duration: program.duration || program.mainSong?.duration || 0,
     description: program.description || "",
     published: published.getTime() > 0 ? published.toISOString().slice(0, 10) : "",
@@ -272,7 +291,7 @@ function toComment(comment) {
     `${reply.user?.nickname || ""}：${reply.content || ""}`).join("\n");
   return {
     id: String(comment.commentId), author: comment.user?.nickname || "",
-    avatarUrl: secureURL(comment.user?.avatarUrl),
+    avatarUrl: artworkURL(comment.user?.avatarUrl),
     text: (comment.content || "") + (quote ? `\n\n回复：${quote}` : ""),
     time: comment.time || 0, likes: comment.likedCount || 0, liked: !!comment.liked,
   };
@@ -302,7 +321,7 @@ async function songDetails(ids, originals = [], options = {}) {
 async function profileFor(activeSession) {
   const data = await request("/api/nuser/account/get", {}, { session: activeSession });
   const profile = activeSession.cookies.MUSIC_U ? data.profile : null;
-  return profile ? { id: String(profile.userId), name: profile.nickname, imageUrl: secureURL(profile.avatarUrl) } : null;
+  return profile ? { id: String(profile.userId), name: profile.nickname, imageUrl: artworkURL(profile.avatarUrl) } : null;
 }
 
 export async function account() {
