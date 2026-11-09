@@ -45,3 +45,11 @@ The unexposed heart-mode candidate is adapted from `HeartMode` in
 `internal/netease/radio.go` at the same preserved upstream commit. Its request
 uses NetEase's intelligence endpoint; live continuation and account validation
 remain pending, so the candidate is not listed in the plugin's navigation.
+
+## 网易云音乐 Plus 的修改
+
+本项目 `VenusLuna/mygo-music-netease-plus` 基于 https://github.com/sogud/mygo-music-netease 的 v0.1.7
+（提交 `2b7f726`，AGPL-3.0-only）。原项目的提交历史、许可证和上述所有来源说明均保留。
+
+2026-11-09 的修改：播放地址改为网页端接口优先、桌面端 eapi 回退（拒绝 `-460`、无权限或只返回试听时）；歌单上限从 1000 首提高到
+10000 首，歌曲详情改为 200 首一批的有限并发加载并加入短期缓存；插件 ID 改为 `netease-plus`，以便和原版共存。

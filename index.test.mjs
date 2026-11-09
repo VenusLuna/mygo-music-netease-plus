@@ -166,16 +166,20 @@ test("stream rejects previews, unavailable tracks and unexpected download hosts"
 
 // Host quality names differ from NetEase's; CDN requests must never get cookies.
 test("stream maps quality and keeps the session away from the CDN", async () => {
-  const { plugin } = await setup(async (_url, init) => {
-    const { data } = decode(init.body);
-    assert.equal(data.level, "exhigh");
-    assert.equal(data.header.MUSIC_U, "synthetic-session");
+  const urls = [];
+  const { plugin } = await setup(async (url, init) => {
+    urls.push(url);
+    const query = new URL(url).searchParams;
+    assert.equal(query.get("level"), "exhigh");
+    assert.match(init.headers.Cookie, /MUSIC_U=synthetic-session/);
     return response({ code: 200, data: [{ id: 1, code: 200, url: "http://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123", type: "mp3", level: "exhigh", size: 100, freeTrialInfo: null }] });
   }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
   const audio = await plugin.stream({ id: "1", quality: "high" });
   assert.equal(audio.url, "https://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123");
   assert.equal(audio.quality, "high");
   assert.equal(audio.headers.Cookie, undefined);
+  assert.equal(urls.length, 1);
+  assert.equal(new URL(urls[0]).origin, "https://music.163.com");
 });
 
 // A late account response after sign-out must not resurrect persisted credentials.
@@ -293,35 +297,63 @@ test("normal cookie renewal remains persisted", async () => {
 });
 
 // Concurrent requests share a single retry, using the same identity and quality.
-test("stream recovers from one 460 without duplicating concurrent requests", async () => {
+test("stream recovers from 460 without duplicating concurrent requests", async () => {
   for (const code of [460, -460]) {
-    const requests = [];
-    const { plugin } = await setup(async (_url, init) => {
-      requests.push(decode(init.body).data);
-      if (requests.length === 1) return response({ code });
+    const desktop = [];
+    let calls = 0;
+    const { plugin } = await setup(async (url, init) => {
+      calls++;
+      if (url.includes("interfacepc")) desktop.push(decode(init.body).data);
+      // The web request and the first desktop request are both refused.
+      if (calls <= 2) return response({ code });
       return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", freeTrialInfo: null }] });
     }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
     const [a, b] = await Promise.all([plugin.stream({ id: "1" }), plugin.stream({ id: "1" })]);
     assert.deepEqual(a, b);
-    assert.equal(requests.length, 2);
-    assert.equal(requests[0].header.deviceId, requests[1].header.deviceId);
-    assert.equal(requests[0].header.MUSIC_U, requests[1].header.MUSIC_U);
-    assert.equal(requests[0].level, requests[1].level);
+    assert.equal(calls, 3);
+    assert.equal(desktop.length, 2);
+    assert.equal(desktop[0].header.deviceId, desktop[1].header.deviceId);
+    assert.equal(desktop[0].header.MUSIC_U, desktop[1].header.MUSIC_U);
+    assert.equal(desktop[0].level, desktop[1].level);
   }
 });
 
-// Persistent rejection stops after two attempts, and the failed promise isn't cached.
+// Persistent rejection stops after two eapi attempts plus one web attempt, and the failed promise isn't cached.
 test("stream bounds persistent 460 retries and releases the in-flight entry", async () => {
   let calls = 0;
   const { plugin } = await setup(async () => {
     calls++;
-    if (calls <= 2) return response({ code: -460 });
+    if (calls <= 3) return response({ code: -460 });
     return response({ code: 200, data: [{ id: 1, url: "https://m1.music.126.net/song.mp3", freeTrialInfo: null }] });
   });
   await assert.rejects(plugin.stream({ id: "1" }), /仍拒绝播放请求（-460）/);
-  assert.equal(calls, 2);
-  assert.equal((await plugin.stream({ id: "1" })).type, "mp3");
   assert.equal(calls, 3);
+  assert.equal((await plugin.stream({ id: "1" })).type, "mp3");
+  assert.equal(calls, 4);
+});
+
+// The desktop eapi is throttled intermittently; the web endpoint serves the same
+// song/quality/account, but preview audio must still be refused there.
+test("stream tries the web endpoint first and falls back to the desktop one", async () => {
+  const cases = [
+    // [web body, desktop body, expected requests]
+    [{ code: 200, data: [{ id: 1, code: 200, url: "http://m1.music.126.net/web.mp3", type: "mp3", freeTrialInfo: null }] }, null, 1, "https://m1.music.126.net/web.mp3"],
+    [{ code: -460 }, { code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/pc.mp3", type: "mp3", freeTrialInfo: null }] }, 2, "https://m1.music.126.net/pc.mp3"],
+    [{ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/clip.mp3", freeTrialInfo: { start: 0 } }] },
+      { code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/pc.mp3", type: "mp3", freeTrialInfo: null }] }, 2, "https://m1.music.126.net/pc.mp3"],
+  ];
+  for (const [web, desktop, expected, url] of cases) {
+    let calls = 0;
+    const { plugin } = await setup(async (target) => {
+      calls++;
+      return response(target.includes("interfacepc") ? desktop : web);
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    assert.equal((await plugin.stream({ id: "1", quality: "standard" })).url, url);
+    assert.equal(calls, expected);
+  }
+  // A preview must stay refused when neither endpoint plays it in full.
+  const trial = await setup(async () => response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/clip.mp3", freeTrialInfo: { start: 0 } }] }));
+  await assert.rejects(trial.plugin.stream({ id: "1" }), (error) => error.code === "unavailable");
 });
 
 // Signing out during backoff must prevent the retry from using another session.
@@ -341,7 +373,7 @@ test("sign-out cancels a scheduled playback retry", async (t) => {
   plugin.signOut();
   wake();
   await assert.rejects(playing, /账号状态已改变/);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 // The retry must not turn permission errors or previews into playback successes.
@@ -353,7 +385,8 @@ test("stream does not retry expired authentication or trial audio", async () => 
     let calls = 0;
     const { plugin } = await setup(async () => { calls++; return response(body); });
     await assert.rejects(plugin.stream({ id: "1" }));
-    assert.equal(calls, 1);
+    // Expired authentication stops at once; a preview is checked on both endpoints.
+    assert.equal(calls, body.code === 301 ? 1 : 2);
   }
 });
 
@@ -503,4 +536,36 @@ test("fixed playlist mapping preserves ownership across lists and detail", async
       assert.equal(mapped.saved, !!source.subscribed, `saved for ${source.id}`);
     }
   }
+});
+
+// Playlists are no longer cut at 1000 songs: details load in bounded parallel
+// batches, keep playlist order, and are cached for the next open.
+test("playlist loads more than 1000 songs in order and reuses cached details", async () => {
+  const total = 2450;
+  const trackIds = Array.from({ length: total }, (_, index) => ({ id: index + 1 }));
+  let detailCalls = 0;
+  let active = 0;
+  let peak = 0;
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("playlist/detail")) {
+      return response({ code: 200, playlist: { id: 9, name: "Big", trackCount: total, trackIds, tracks: [], creator: { userId: 1 } } });
+    }
+    const ids = JSON.parse(decode(init.body).data.c).map(item => item.id);
+    detailCalls++;
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active--;
+    assert.ok(ids.length <= 200);
+    return response({ code: 200, songs: ids.map(id => song(id)), privileges: ids.map(id => ({ id, st: 0, pl: 128000 })) });
+  });
+  const first = await plugin.playlist({ id: "9" });
+  assert.equal(first.tracks.length, total);
+  assert.deepEqual(first.tracks.slice(0, 3).map(track => track.id), ["1", "2", "3"]);
+  assert.equal(first.tracks[total - 1].id, String(total));
+  assert.ok(!first.description.includes("已载入前"));
+  assert.equal(detailCalls, Math.ceil(total / 200));
+  assert.ok(peak > 1 && peak <= 8);
+  assert.equal((await plugin.playlist({ id: "9" })).tracks.length, total);
+  assert.equal(detailCalls, Math.ceil(total / 200));
 });

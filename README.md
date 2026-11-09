@@ -1,13 +1,27 @@
-# 网易云音乐 · MyGo Music 插件
+# 网易云音乐 Plus · MyGo Music 插件
 
 在 [MyGo Music](https://github.com/egoist/mygo-music) 中搜索和播放网易云音乐。需要 MyGo Music 0.1.20 或更新版本，无需额外服务。
 
-网易云 CDN 封面使用 `{size}` 模板，由主程序按列表、卡片及播放页所需尺寸请求缩略图，减少首次下载和大图解码。0.1.20 之前的主程序不支持此模板，使用前请先升级。
+> 本项目基于 [sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease)（v0.1.7，提交 `2b7f726`）修改而来，继续以 AGPL-3.0 发布，原作者和贡献者的提交历史已保留。它不是官方版本，也不是原项目的替代品，而是一个侧重播放稳定性和大歌单的分支。
+
+## 和原版的区别
+
+| | [原版 sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease) | 本项目（Plus） |
+|---|---|---|
+| 插件 ID / 名称 | `netease` / 网易云音乐 | `netease-plus` / 网易云音乐 Plus，可与原版同时安装，互不覆盖 |
+| 播放地址接口 | 桌面端 eapi（`interfacepc.music.163.com`），仅重试一次 | 网页端接口优先（快、很少被风控），被拒、无权限或仅返回试听时回退桌面端并延迟重试 |
+| `-460` 拒绝播放 | 两次 eapi 都被拒即报错（「网易云仍拒绝播放请求（-460）」） | 实测不再出现；两个接口都拒绝才报错 |
+| 歌单歌曲上限 | 前 1000 首 | 网易云上限 10000 首，实测 9862 首歌单完整载入（约 8 秒） |
+| 歌曲详情加载 | 400 首一批，整批并发 | 200 首一批、最多 8 路并发，5 分钟缓存，再次打开歌单约 0.8 秒 |
+| 超大歌单超时 | 无保护 | 超过 20 秒停止并在歌单描述中说明已载入数量，避免超过宿主 30 秒调用限制 |
+| 其他功能 | 搜索、推荐、扫码登录、歌词、评论、播客、歌单编辑等 | 保持一致，没有修改 |
+
+注意：插件 ID 不同，首次使用需要重新扫码登录，原版的登录状态不会带过来。歌单仍由宿主一次性读取（MyGo Music 的 `playlist` 接口没有分页参数），因此还不是滚动加载。
 
 ## 安装和使用
 
-1. 打开 MyGo Music → 设置 → 插件 → `+` → 从 GitHub 安装，填入 `sogud/mygo-music-netease`。也可从 [Releases](https://github.com/sogud/mygo-music-netease/releases) 下载 ZIP 后从本地安装，或选择本项目文件夹。
-2. 安装后，在来源选择器中选择 **网易云音乐**。
+1. 打开 MyGo Music → 设置 → 插件 → `+` → 从 GitHub 安装，填入 `VenusLuna/mygo-music-netease-plus`。也可从 [Releases](https://github.com/VenusLuna/mygo-music-netease-plus/releases) 下载 ZIP 后从本地安装，或选择本项目文件夹。
+2. 安装后，在来源选择器中选择 **网易云音乐 Plus**。
 3. 点击 **登录**，用网易云音乐手机 App 扫码，访问自己的歌单和喜欢的音乐。
 4. 每日推荐、私人雷达和个性化歌单集中在 **发现音乐**；侧栏保留 **私人漫游** 专页和 **排行榜**。推荐歌单加载失败时，可在该区域点 **查看全部** 重试，其他入口仍可使用。
 

@@ -5,7 +5,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 root = Path(__file__).resolve().parent
 manifest = json.loads((root / "plugin.json").read_text())
-destination = root / "dist" / f"netease-{manifest['version']}.zip"
+destination = root / "dist" / f"netease-plus-{manifest['version']}.zip"
 destination.parent.mkdir(exist_ok=True)
 with ZipFile(destination, "w", compression=ZIP_DEFLATED) as archive:
     for name in ("plugin.json", "index.js", "LICENSE", "THIRD_PARTY_NOTICES.md", "README.md"):

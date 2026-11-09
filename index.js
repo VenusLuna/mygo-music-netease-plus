@@ -10,7 +10,14 @@ const EAPI_KEY = "e82ckenh8dichen8";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 const EAPI_UA = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 const PAGE_SIZE = 30;
-const PLAYLIST_LIMIT = 1000;
+// NetEase caps a playlist at 10000 songs. The host asks for a playlist in one
+// call that times out after 30s, so loading stops at a time budget and says so.
+const PLAYLIST_LIMIT = 10000;
+const PLAYLIST_BUDGET_MS = 20000;
+const DETAIL_BATCH = 200;
+const DETAIL_CONCURRENCY = 8;
+const DETAIL_TTL_MS = 5 * 60 * 1000;
+const DETAIL_CACHE_MAX = 20000;
 const PRIVATE_RADAR = "3136952023";
 const COOKIE_NAMES = ["MUSIC_U", "__csrf", "NMTID"];
 
@@ -21,6 +28,7 @@ let epoch = 0;
 let profileCheckedAt = 0;
 let likedCache = null;
 const pendingStreams = new Map();
+const detailCache = new Map();
 let discoveryCovers = null;
 let heartState = null;
 let pendingHeart = null;
@@ -112,6 +120,7 @@ function clearSession() {
   session = { cookies: {}, profile: null };
   profileCheckedAt = 0;
   likedCache = null;
+  detailCache.clear();
   pendingStreams.clear();
   heartState = null;
   pendingHeart = null;
@@ -297,22 +306,52 @@ function toComment(comment) {
   };
 }
 
+// Fetch song details in bounded parallel batches. Details are cached briefly,
+// so reopening a large playlist is fast. With options.budgetMs, batches not
+// started in time are skipped and the result ends at the first skipped song.
 async function songDetails(ids, originals = [], options = {}) {
   if (!ids.length) return [];
-  const batches = [];
-  for (let offset = 0; offset < ids.length; offset += 400) {
-    batches.push(ids.slice(offset, offset + 400));
+  const { budgetMs, ...requestOptions } = options;
+  // Privileges belong to an account: only cache for the current session.
+  const useCache = !requestOptions.session;
+  const started = Date.now();
+  const found = new Map();
+  const missing = [];
+  for (const id of ids) {
+    const hit = useCache ? detailCache.get(String(id)) : null;
+    if (hit && started - hit.at < DETAIL_TTL_MS) found.set(String(id), hit.song);
+    else missing.push(id);
   }
-  const results = await Promise.all(batches.map(async (batch) => {
-    const data = await eapi("/api/v3/song/detail", { c: JSON.stringify(batch.map((id) => ({ id: Number(idOf(id)) }))) }, options);
-    const privileges = new Map((data.privileges || []).map((p) => [String(p.id), p]));
-    return (data.songs || []).map((song) => ({ ...song, privilege: privileges.get(String(song.id)) || song.privilege }));
-  }));
-  const byID = new Map(results.flat().map((song) => [String(song.id), song]));
+  const batches = [];
+  for (let offset = 0; offset < missing.length; offset += DETAIL_BATCH) {
+    batches.push(missing.slice(offset, offset + DETAIL_BATCH));
+  }
+  const skipped = new Set();
+  const generation = epoch;
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const batch = batches[next++];
+      if (budgetMs && Date.now() - started > budgetMs) { batch.forEach((id) => skipped.add(String(id))); continue; }
+      const data = await eapi("/api/v3/song/detail", { c: JSON.stringify(batch.map((id) => ({ id: Number(idOf(id)) }))) }, requestOptions);
+      const privileges = new Map((data.privileges || []).map((p) => [String(p.id), p]));
+      for (const song of data.songs || []) {
+        const record = { ...song, privilege: privileges.get(String(song.id)) || song.privilege };
+        found.set(String(song.id), record);
+        if (useCache && generation === epoch) {
+          if (detailCache.size >= DETAIL_CACHE_MAX) detailCache.clear();
+          detailCache.set(String(song.id), { song: record, at: Date.now() });
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(DETAIL_CONCURRENCY, batches.length) }, worker));
+  const cut = skipped.size ? ids.findIndex((id) => skipped.has(String(id))) : -1;
+  const wanted = cut >= 0 ? ids.slice(0, cut) : ids;
   const fallback = new Map(originals.map((song) => [String(song.id), song]));
   // MyGo advances offset by the number of returned tracks. Keep a slot for
   // every requested ID, including songs removed from the detail response.
-  return ids.map((id) => byID.get(String(id)) || {
+  return wanted.map((id) => found.get(String(id)) || {
     ...(fallback.get(String(id)) || { id, name: "歌曲暂不可用" }),
     privilege: { st: -1, pl: 0 },
   });
@@ -377,6 +416,7 @@ export async function signIn() {
       pendingHeart = null;
       profileCheckedAt = Date.now();
       likedCache = null;
+      detailCache.clear();
       persistSession();
       host.signInPrompt({ text: "登录成功" });
       return pending.profile;
@@ -492,14 +532,15 @@ export async function playlists() {
 }
 
 export async function playlist({ id }) {
-  const data = await request("/api/v6/playlist/detail", { id: idOf(id), n: PLAYLIST_LIMIT });
+  const data = await request("/api/v6/playlist/detail", { id: idOf(id), n: 1 });
   if (!data.playlist) throw fail("unavailable", "歌单不存在或当前账号无权访问");
   const source = data.playlist;
   const ids = (source.trackIds || source.tracks || []).slice(0, PLAYLIST_LIMIT).map((track) => track.id);
   const result = toPlaylist(source);
-  result.tracks = (await songDetails(ids, source.tracks || [])).map(toTrack);
-  if (source.trackCount > PLAYLIST_LIMIT) {
-    result.description += `\n本版本载入前 ${PLAYLIST_LIMIT} 首（歌单共 ${source.trackCount} 首）。`;
+  const tracks = await songDetails(ids, source.tracks || [], { budgetMs: PLAYLIST_BUDGET_MS });
+  result.tracks = tracks.map(toTrack);
+  if (tracks.length < Math.max(source.trackCount || 0, ids.length)) {
+    result.description += `\n已载入前 ${tracks.length} 首（歌单共 ${source.trackCount} 首），其余因载入时间或数量限制未显示。`;
   }
   return result;
 }
@@ -634,7 +675,7 @@ async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
 
 async function playlistTrackIDs(id, activeSession, generation) {
   checkPlaylistSession(activeSession, generation);
-  const data = await request("/api/v6/playlist/detail", { id, n: PLAYLIST_LIMIT }, {
+  const data = await request("/api/v6/playlist/detail", { id, n: 1 }, {
     session: activeSession, keepSession: true,
   });
   checkPlaylistSession(activeSession, generation);
@@ -729,22 +770,37 @@ export async function stream({ id, quality = "high" }) {
 
 async function loadStream(id, quality, generation) {
   const level = { standard: "standard", high: "exhigh", lossless: "lossless" }[quality] || "exhigh";
-  let data;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (generation !== epoch) throw new Error("账号状态已改变，请重试");
+  const params = { ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3" };
+  const usable = (body) => {
+    const item = (body?.data || []).find((entry) => String(entry.id) === id);
+    return !!item && !!item.url && (item.code === undefined || item.code === 200) && item.freeTrialInfo == null;
+  };
+  const refusal = (error) => [460, -460].includes(error.neteaseCode);
+  const stale = () => { if (generation !== epoch) throw new Error("账号状态已改变，请重试"); };
+  let data = null;
+  let refused = null;
+  // The web endpoint answers faster and is rarely risk-controlled (-460), but
+  // may withhold a song the desktop endpoint plays in full. Try it first and
+  // fall back to the desktop endpoint (same account, device and quality)
+  // unless it already gave complete audio. Permission, preview and format
+  // checks below still decide; this never turns a preview into a success.
+  stale();
+  try { data = await request("/api/song/enhance/player/url/v1", params); }
+  catch (error) { if (!refusal(error)) throw error; refused = error; }
+  for (let attempt = 0; !usable(data) && attempt < 2; attempt++) {
+    stale();
     try {
-      data = await eapi("/api/song/enhance/player/url/v1", {
-        ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
-      });
+      data = await eapi("/api/song/enhance/player/url/v1", params);
+      refused = null;
       break;
     } catch (error) {
-      if (![460, -460].includes(error.neteaseCode)) throw error;
-      if (attempt === 1) throw new Error(`网易云仍拒绝播放请求（${error.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
-      // One delayed retry of this read only, with the same device/account and
-      // quality. Never retry account mutations or turn permission failures
-      // into a different source, a preview, or a lower-quality success.
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (!refusal(error)) throw error;
+      refused = error;
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 1000));
     }
+  }
+  if (!data) {
+    throw new Error(`网易云仍拒绝播放请求（${refused.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
   }
   const audio = (data.data || []).find((item) => String(item.id) === id);
   if (!audio || !audio.url || (audio.code !== undefined && audio.code !== 200) || audio.freeTrialInfo != null) {
