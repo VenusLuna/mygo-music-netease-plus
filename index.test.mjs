@@ -651,6 +651,40 @@ test("postComment posts to the track thread and rejects empty or long text", asy
   await assert.rejects(plugin.postComment({ trackId: "1", text: "字".repeat(141) }), /140/);
 });
 
+// Comment likes target the same song or program thread as the comment list.
+test("likeComment likes and unlikes song and episode comments", async () => {
+  const sent = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    const { path, data } = decode(init.body);
+    sent.push({ path, data });
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  await plugin.likeComment({ trackId: "1", commentId: "9", on: true });
+  await plugin.likeComment({ trackId: "program:12:34", commentId: 10, on: false });
+  assert.deepEqual(sent.map(({ path, data }) => [path, data.threadId, data.commentId]), [
+    ["/api/v1/comment/like", "R_SO_4_1", "9"],
+    ["/api/v1/comment/unlike", "A_DJ_1_12", "10"],
+  ]);
+  await assert.rejects(plugin.likeComment({ trackId: "1", commentId: "invalid", on: true }), /无效/);
+  assert.equal(sent.length, 2);
+});
+
+// Guests must be asked to sign in without sending a like request.
+test("likeComment requires sign-in", async () => {
+  let requests = 0;
+  const { plugin } = await setup(async () => {
+    requests++;
+    return response({ code: 200 });
+  });
+  await assert.rejects(plugin.likeComment({ trackId: "1", commentId: "9", on: true }), error => {
+    assert.equal(error.code, "signIn");
+    assert.match(error.message, /请先扫码登录/);
+    return true;
+  });
+  assert.equal(requests, 0);
+});
+
 // A repeated or truncated subscription page must not hide the podcasts we have.
 test("shows keeps paging subscriptions and returns what it got", async () => {
   const { plugin } = await setup(async (url) => {

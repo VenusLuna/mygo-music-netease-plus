@@ -923,6 +923,15 @@ export async function postComment({ trackId, text }) {
   return toComment(comment);
 }
 
+export async function likeComment({ trackId, commentId, on }) {
+  await requireAccount();
+  const identity = trackIdentity(trackId);
+  const cid = idOf(commentId);
+  await eapi(`/api/v1/comment/${on ? "like" : "unlike"}`, {
+    threadId: identity.thread, commentId: cid,
+  }, { keepSession: true });
+}
+
 // The host asks stationNext again as the queue runs out. These modes are
 // NetEase's own recommendations, not a shuffle of the current local list.
 function stationList() {
