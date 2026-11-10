@@ -525,6 +525,10 @@ export async function browse({ page }) {
   return { title: "排行榜", sections: [{ playlists: (data.list || []).map(toPlaylist) }] };
 }
 
+function isOwnLikedPlaylist(item, profile) {
+  return item && Number(item.specialType) === 5 && String(item.creator?.userId) === profile.id;
+}
+
 export async function playlists() {
   const profile = await account();
   if (!profile) return [];
@@ -533,7 +537,8 @@ export async function playlists() {
   for (let offset = 0; ; offset += 200) {
     const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset });
     const items = data.playlist || [];
-    result.push(...items.map(toPlaylist));
+    // The host already has a fixed liked-songs entry; only list other playlists.
+    result.push(...items.filter(item => !isOwnLikedPlaylist(item, profile)).map(toPlaylist));
     if (!data.more || items.length < 200) return result;
     if (offset >= 1800) throw new Error("账号歌单超过首版支持的 2000 个，暂时无法完整加载");
   }
@@ -678,8 +683,7 @@ async function likedPlaylist(profile, options = {}, afterPage) {
     const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset }, options);
     if (afterPage) afterPage();
     if (!Array.isArray(data.playlist)) throw new Error("无法读取喜欢的音乐歌单");
-    const found = data.playlist.find(item => item && Number(item.specialType) === 5 &&
-      String(item.creator?.userId) === profile.id);
+    const found = data.playlist.find(item => isOwnLikedPlaylist(item, profile));
     if (found) return found;
     if (!data.more || data.playlist.length < 200) return null;
   }

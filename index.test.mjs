@@ -510,8 +510,9 @@ test("radio and diagnostic authentication failures keep their sign-in error", as
   }
 });
 
-// The host must recognize NetEase's built-in liked playlist without losing ownership.
-test("fixed playlist mapping preserves ownership across lists and detail", async () => {
+// The host already shows the listener's liked songs, so do not repeat that
+// playlist under My Playlists. Another user's liked playlist remains visible.
+test("fixed playlist mapping preserves ownership and hides the duplicate liked list", async () => {
   const fixtures = [
     { id: 21, specialType: 5, creator: { userId: 7 }, expectedFixed: true, expectedMine: true },
     { id: 22, specialType: "5", creator: { userId: 8 }, subscribed: true, expectedFixed: true, expectedMine: false },
@@ -528,14 +529,15 @@ test("fixed playlist mapping preserves ownership across lists and detail", async
     throw new Error(`Unexpected request: ${url}`);
   }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
   const lists = await plugin.playlists();
-  assert.equal(lists.length, fixtures.length);
-  for (const [i, source] of fixtures.entries()) {
-    for (const mapped of [lists[i], await plugin.playlist({ id: String(source.id) })]) {
-      assert.equal(mapped.fixed, source.expectedFixed, `fixed for ${source.id}`);
-      assert.equal(mapped.mine, source.expectedMine, `mine for ${source.id}`);
-      assert.equal(mapped.saved, !!source.subscribed, `saved for ${source.id}`);
-    }
-  }
+  const listed = fixtures.slice(1);
+  assert.deepEqual(lists.map(list => list.id), listed.map(source => String(source.id)));
+  const assertFlags = (mapped, source) => {
+    assert.equal(mapped.fixed, source.expectedFixed, `fixed for ${source.id}`);
+    assert.equal(mapped.mine, source.expectedMine, `mine for ${source.id}`);
+    assert.equal(mapped.saved, !!source.subscribed, `saved for ${source.id}`);
+  };
+  for (const [i, source] of listed.entries()) assertFlags(lists[i], source);
+  for (const source of fixtures) assertFlags(await plugin.playlist({ id: String(source.id) }), source);
 });
 
 // Playlists are no longer cut at 1000 songs: details load in bounded parallel
