@@ -613,11 +613,39 @@ export async function artist({ id }) {
   };
 }
 
+// The listener's own liked-songs playlist, which NetEase marks specialType 5.
+async function likedPlaylist(profile, options = {}, afterPage) {
+  for (let offset = 0; offset < 2000; offset += 200) {
+    const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset }, options);
+    if (afterPage) afterPage();
+    if (!Array.isArray(data.playlist)) throw new Error("无法读取喜欢的音乐歌单");
+    const found = data.playlist.find(item => item && Number(item.specialType) === 5 &&
+      String(item.creator?.userId) === profile.id);
+    if (found) return found;
+    if (!data.more || data.playlist.length < 200) return null;
+  }
+  return null;
+}
+
 async function likedIDs() {
   const profile = await requireAccount();
   if (likedCache && likedCache.uid === profile.id && Date.now() - likedCache.at < 60000) return likedCache.ids;
-  const data = await eapi("/api/song/like/get", { uid: profile.id });
-  const ids = (data.ids || []).map(String);
+  // The playlist keeps the order the app shows, newest like first. The like map
+  // answers the same songs in no particular order, so using it first made the
+  // list look shuffled and disagree with the playlist opened from My Playlists.
+  let ids = null;
+  try {
+    const playlist = await likedPlaylist(profile);
+    if (playlist) {
+      const data = await request("/api/v6/playlist/detail", { id: idOf(playlist.id), n: 1 });
+      const ordered = (data.playlist?.trackIds || []).map((track) => String(track.id));
+      if (ordered.length) ids = ordered;
+    }
+  } catch (error) {
+    if (error.code === "signIn") throw error;
+    // A failed lookup falls back to the like map rather than failing the page.
+  }
+  if (!ids) ids = ((await eapi("/api/song/like/get", { uid: profile.id })).ids || []).map(String);
   likedCache = { uid: profile.id, ids, at: Date.now() };
   return ids;
 }
@@ -851,20 +879,10 @@ function checkHeartAccount(activeSession, generation) {
 }
 
 async function startHeart(activeSession, generation, profile) {
-  let likedPlaylist;
-  for (let offset = 0; offset < 2000; offset += 200) {
-    const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset }, {
-      session: activeSession, keepSession: true,
-    });
-    checkHeartAccount(activeSession, generation);
-    if (!Array.isArray(data.playlist)) throw new Error("无法读取喜欢的音乐歌单");
-    likedPlaylist = data.playlist.find(item => item && Number(item.specialType) === 5 &&
-      String(item.creator?.userId) === profile.id);
-    if (likedPlaylist) break;
-    if (!data.more || data.playlist.length < 200) break;
-  }
-  if (!likedPlaylist) throw fail("unavailable", "未找到当前账号的喜欢歌单，暂时无法开启心动模式");
-  const playlistID = idOf(likedPlaylist.id);
+  const liked = await likedPlaylist(profile, { session: activeSession, keepSession: true },
+    () => checkHeartAccount(activeSession, generation));
+  if (!liked) throw fail("unavailable", "未找到当前账号的喜欢歌单，暂时无法开启心动模式");
+  const playlistID = idOf(liked.id);
   const data = await request("/api/v6/playlist/detail", { id: playlistID, n: 1 }, {
     session: activeSession, keepSession: true,
   });

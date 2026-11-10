@@ -569,3 +569,35 @@ test("playlist loads more than 1000 songs in order and reuses cached details", a
   assert.equal((await plugin.playlist({ id: "9" })).tracks.length, total);
   assert.equal(detailCalls, Math.ceil(total / 200));
 });
+
+// The liked playlist keeps the order the app shows; the like map does not.
+test("liked follows the liked playlist order and falls back to the like map", async () => {
+  const order = ["3", "1", "2"];
+  const paths = [];
+  const { plugin } = await setup(async (url, init) => {
+    paths.push(new URL(url).pathname);
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("/api/user/playlist")) return response({ code: 200, more: false, playlist: [
+      { id: 8, name: "Other", specialType: 0, trackCount: 0, creator: { userId: 7 } },
+      { id: 9, name: "Liked", specialType: 5, trackCount: 3, creator: { userId: 7 } },
+    ] });
+    if (url.includes("/api/v6/playlist/detail")) return response({ code: 200, playlist: {
+      id: 9, specialType: 5, trackCount: 3, creator: { userId: 7 }, trackIds: order.map(id => ({ id: Number(id) })),
+    } });
+    if (url.includes("song/like/get")) return response({ code: 200, ids: [1, 2, 3] });
+    const ids = JSON.parse(decode(init.body).data.c).map(item => item.id);
+    return response({ code: 200, songs: ids.map(song), privileges: ids.map(id => ({ id, st: 0, pl: 128000 })) });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  assert.deepEqual((await plugin.liked({ offset: 0 })).tracks.map(track => track.id), order);
+  assert.ok(!paths.some(path => path.includes("song/like/get")));
+
+  // Without a liked playlist the like map still answers, in its own order.
+  const fallback = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("/api/user/playlist")) return response({ code: 200, more: false, playlist: [] });
+    if (url.includes("song/like/get")) return response({ code: 200, ids: [2, 3] });
+    const ids = JSON.parse(decode(init.body).data.c).map(item => item.id);
+    return response({ code: 200, songs: ids.map(song), privileges: ids.map(id => ({ id, st: 0, pl: 128000 })) });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  assert.deepEqual((await fallback.plugin.liked({ offset: 0 })).tracks.map(track => track.id), ["2", "3"]);
+});
