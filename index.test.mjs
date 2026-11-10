@@ -632,6 +632,137 @@ test("cloud disk lists uploaded songs and pages through them", async () => {
   assert.equal(tracks[1].duration, 0);
 });
 
+// The host exposes its full playlist UI when these write capabilities exist.
+test("playlist lifecycle creates, renames, saves and deletes playlists", async () => {
+  const sent = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    const { path, data: { header, e_r, ...data } } = decode(init.body);
+    sent.push({ path, data });
+    if (path === "/api/playlist/create") return response({ code: 200, playlist: {
+      id: 9, name: data.name, creator: { userId: 7, nickname: "Fixture" }, trackCount: 0,
+    } });
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+  const created = await plugin.createPlaylist({ name: "  New list  " });
+  assert.equal(created.id, "9");
+  assert.equal(created.name, "New list");
+  assert.equal(created.mine, true);
+  await plugin.renamePlaylist({ id: "9", name: "  Renamed  " });
+  await plugin.savePlaylist({ id: "9", on: true });
+  await plugin.savePlaylist({ id: "9", on: false });
+  await plugin.deletePlaylist({ id: "9" });
+  assert.deepEqual(sent.map(({ path, data }) => [path, data]), [
+    ["/api/playlist/create", { name: "New list", privacy: 0, type: "NORMAL" }],
+    ["/api/playlist/update/name", { id: "9", name: "Renamed" }],
+    ["/api/playlist/subscribe", { id: "9" }],
+    ["/api/playlist/unsubscribe", { id: "9" }],
+    ["/api/playlist/remove", { ids: "[9]" }],
+  ]);
+});
+
+// Reordering submits the complete order; it never removes and re-adds a song.
+test("movePlaylistTrack moves in both directions and validates positions", async () => {
+  const updates = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("playlist/detail")) return response({ code: 200, playlist: {
+      id: 9, trackCount: 4, trackIds: [1, 2, 3, 4].map(id => ({ id })),
+    } });
+    const form = new URLSearchParams(init.body);
+    updates.push(Object.fromEntries(form));
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session", __csrf: "synthetic-csrf" }, profile: null });
+
+  await plugin.movePlaylistTrack({ id: "9", from: 0, to: 2 });
+  await plugin.movePlaylistTrack({ id: "9", from: 3, to: 1 });
+  await plugin.movePlaylistTrack({ id: "9", from: 2, to: 2 });
+  assert.deepEqual(updates.map(form => [form.op, form.pid, form.trackIds, form.csrf_token]), [
+    ["update", "9", "[2,3,1,4]", "synthetic-csrf"],
+    ["update", "9", "[1,4,2,3]", "synthetic-csrf"],
+  ]);
+  for (const [from, to] of [[-1, 0], [0, 4], [1.5, 2], ["0", 1]]) {
+    await assert.rejects(plugin.movePlaylistTrack({ id: "9", from, to }), /排序位置/);
+  }
+  assert.equal(updates.length, 2);
+});
+
+// A partial or stale track list must never be submitted as the complete order.
+test("movePlaylistTrack refuses incomplete lists and account changes", async () => {
+  let updates = 0;
+  const partial = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("playlist/detail")) return response({ code: 200, playlist: {
+      id: 9, trackCount: 3, trackIds: [{ id: 1 }, { id: 2 }],
+    } });
+    updates++;
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(partial.plugin.movePlaylistTrack({ id: "9", from: 0, to: 1 }), /完整歌曲列表/);
+  assert.equal(updates, 0);
+
+  let finish;
+  const changed = await setup((url) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    return new Promise(resolve => { finish = resolve; });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const pending = changed.plugin.movePlaylistTrack({ id: "9", from: 0, to: 1 });
+  while (!finish) await new Promise(resolve => setImmediate(resolve));
+  changed.plugin.signOut();
+  finish(response({ code: 200, playlist: { id: 9, trackCount: 2, trackIds: [{ id: 1 }, { id: 2 }] } }));
+  await assert.rejects(pending, /账号状态已改变/);
+});
+
+// Existing batch writes keep their ID normalization and duplicate retry behavior.
+test("playlist track writes normalize IDs and retry only missing songs", async () => {
+  const forms = [];
+  let duplicate = true;
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("playlist/detail")) return response({ code: 200, playlist: {
+      id: 9, trackCount: 1, trackIds: [{ id: 1 }],
+    } });
+    const form = Object.fromEntries(new URLSearchParams(init.body));
+    forms.push(form);
+    if (form.op === "add" && duplicate) {
+      duplicate = false;
+      return response({ code: 502 });
+    }
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await plugin.addToPlaylist({ id: "9", trackIds: ["1", "2", "1"] });
+  await plugin.removeFromPlaylist({ id: "9", trackIds: ["2"] });
+  assert.deepEqual(forms.map(form => [form.op, form.trackIds]), [
+    ["add", "[1,2]"], ["add", "[2]"], ["del", "[2]"],
+  ]);
+  await assert.rejects(plugin.addToPlaylist({ id: "9", trackIds: ["program:12:34"] }), { code: "unsupported" });
+  assert.equal(forms.length, 3);
+});
+
+// Invalid input and guest writes fail before any playlist mutation request.
+test("playlist management validates input and requires sign-in", async () => {
+  let requests = 0;
+  const invalid = await setup(async () => { requests++; return response({ code: 200 }); });
+  await assert.rejects(invalid.plugin.createPlaylist({ name: "  " }), /名称/);
+  await assert.rejects(invalid.plugin.renamePlaylist({ id: "9", name: "" }), /名称/);
+  await assert.rejects(invalid.plugin.deletePlaylist({ id: "invalid" }), /无效/);
+  await assert.rejects(invalid.plugin.savePlaylist({ id: "invalid", on: true }), /无效/);
+  assert.equal(requests, 0);
+
+  const guest = await setup(async () => { requests++; return response({ code: 200 }); });
+  for (const action of [
+    () => guest.plugin.createPlaylist({ name: "New" }),
+    () => guest.plugin.renamePlaylist({ id: "9", name: "New" }),
+    () => guest.plugin.deletePlaylist({ id: "9" }),
+    () => guest.plugin.savePlaylist({ id: "9", on: true }),
+    () => guest.plugin.movePlaylistTrack({ id: "9", from: 0, to: 1 }),
+    () => guest.plugin.addToPlaylist({ id: "9", trackIds: ["1"] }),
+    () => guest.plugin.removeFromPlaylist({ id: "9", trackIds: ["1"] }),
+  ]) await assert.rejects(action(), { code: "signIn" });
+  assert.equal(requests, 0);
+});
+
 // Comments are posted through the desktop endpoint, which carries the session.
 test("postComment posts to the track thread and rejects empty or long text", async () => {
   const sent = [];

@@ -741,10 +741,47 @@ export async function like({ id, on }) {
   likedCache = null;
 }
 
+function playlistName(value) {
+  const name = String(value ?? "").trim();
+  if (!name) throw new Error("歌单名称不能为空");
+  return name;
+}
+
+export async function createPlaylist({ name }) {
+  name = playlistName(name);
+  await requireAccount();
+  const data = await eapi("/api/playlist/create", { name, privacy: 0, type: "NORMAL" }, { keepSession: true });
+  if (!data.playlist || typeof data.playlist !== "object") throw new Error("网易云未返回新建的歌单");
+  return toPlaylist(data.playlist);
+}
+
+export async function renamePlaylist({ id, name }) {
+  id = idOf(id);
+  name = playlistName(name);
+  await requireAccount();
+  await eapi("/api/playlist/update/name", { id, name }, { keepSession: true });
+}
+
+export async function deletePlaylist({ id }) {
+  id = idOf(id);
+  await requireAccount();
+  await eapi("/api/playlist/remove", { ids: JSON.stringify([Number(id)]) }, { keepSession: true });
+}
+
+export async function savePlaylist({ id, on }) {
+  id = idOf(id);
+  await requireAccount();
+  await eapi(`/api/playlist/${on ? "subscribe" : "unsubscribe"}`, { id }, { keepSession: true });
+}
+
 function checkPlaylistSession(activeSession, generation) {
   if (generation !== epoch || activeSession !== session) {
     throw new Error("账号状态已改变，请重试");
   }
+}
+
+function playlistOperationName(op) {
+  return { add: "添加到歌单", del: "移出歌单", update: "调整歌曲顺序" }[op] || "修改歌单";
 }
 
 async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
@@ -759,7 +796,7 @@ async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
     return data;
   } catch (error) {
     // Preserve signIn so the host can offer login; a content 401 keeps session.
-    error.message = `${op === "add" ? "添加到歌单" : "移出歌单"}失败：${error.message}`;
+    error.message = `${playlistOperationName(op)}失败：${error.message}`;
     throw error;
   }
 }
@@ -774,7 +811,7 @@ async function playlistTrackIDs(id, activeSession, generation) {
   if (String(source?.id) !== id || !Array.isArray(source.trackIds) || source.trackIds.length < source.trackCount) {
     throw new Error("无法确认歌单的完整歌曲列表，请刷新后重试");
   }
-  return new Set(source.trackIds.map(track => String(track.id)));
+  return source.trackIds.map(track => idOf(track.id));
 }
 
 async function manipulatePlaylistTracks(op, id, trackIds) {
@@ -795,7 +832,7 @@ async function manipulatePlaylistTracks(op, id, trackIds) {
   if (op === "add" && Number(data.code) === 502) {
     // A duplicate rejects the whole batch. Only retry songs proved absent;
     // never treat an unexplained 502 or a concurrent edit as successful.
-    const present = await playlistTrackIDs(pid, activeSession, generation);
+    const present = new Set(await playlistTrackIDs(pid, activeSession, generation));
     const missing = ids.filter(trackID => !present.has(trackID));
     if (!missing.length) {
       throw fail("duplicate", ids.length === 1 ? "这首歌已经在这个歌单里了" : "这些歌曲已经在这个歌单里了");
@@ -805,7 +842,7 @@ async function manipulatePlaylistTracks(op, id, trackIds) {
     }
   }
   if (Number(data.code) !== 200) {
-    throw new Error(`${op === "add" ? "添加到歌单" : "移出歌单"}未完成（${data.code}），请刷新歌单后重试`);
+    throw new Error(`${playlistOperationName(op)}未完成（${data.code}），请刷新歌单后重试`);
   }
   likedCache = null;
 }
@@ -816,6 +853,27 @@ export async function addToPlaylist({ id, trackIds }) {
 
 export async function removeFromPlaylist({ id, trackIds }) {
   await manipulatePlaylistTracks("del", id, trackIds);
+}
+
+export async function movePlaylistTrack({ id, from, to }) {
+  const pid = String(Number(idOf(id)));
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to < 0) {
+    throw new Error("无效的歌曲排序位置");
+  }
+  const activeSession = currentSession();
+  const generation = epoch;
+  await requireAccount();
+  checkPlaylistSession(activeSession, generation);
+  const ids = await playlistTrackIDs(pid, activeSession, generation);
+  if (from >= ids.length || to >= ids.length) throw new Error("歌曲排序位置超出歌单范围");
+  if (from === to) return;
+  const [track] = ids.splice(from, 1);
+  ids.splice(to, 0, track);
+  const data = await submitPlaylistTracks("update", pid, ids, activeSession, generation);
+  if (Number(data.code) !== 200) {
+    throw new Error(`调整歌曲顺序未完成（${data.code}），请刷新歌单后重试`);
+  }
+  likedCache = null;
 }
 
 export async function comments({ trackId, offset = 0 }) {
