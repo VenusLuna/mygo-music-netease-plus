@@ -601,3 +601,85 @@ test("liked follows the liked playlist order and falls back to the like map", as
   }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
   assert.deepEqual((await fallback.plugin.liked({ offset: 0 })).tracks.map(track => track.id), ["2", "3"]);
 });
+
+// Cloud disk songs may or may not carry catalog metadata; both map to a track,
+// and the list pages until hasMore is false.
+test("cloud disk lists uploaded songs and pages through them", async () => {
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (url.includes("/api/v1/cloud/get")) {
+      return response({ code: 200, count: 3, hasMore: true, data: [
+        { privateCloud: { songId: 11, song: "A.mp3", artist: "未知艺术家", album: "未知专辑" },
+          simpleSong: { id: 11, name: "爱人穿过你", dt: 200000, ar: [{ id: 1, name: "刘森" }], al: { id: 2, name: "华北浪革", picUrl: "http://p1.music.126.net/a.jpg" } } },
+        { privateCloud: { songId: 12, song: "B.flac", artist: "某人", album: "某专辑" } },
+        { privateCloud: { songId: 11, song: "A.mp3" } },
+      ] });
+    }
+    return response({ code: 200, data: [], hasMore: false });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  const page = await plugin.browse({ page: "cloud" });
+  assert.equal(page.title, "我的云盘");
+  const tracks = page.sections[0].tracks;
+  assert.deepEqual(tracks.map(track => track.id), ["11", "12"]);
+  assert.equal(tracks[0].name, "爱人穿过你");
+  assert.deepEqual(tracks[0].artists.map(artist => artist.name), ["刘森"]);
+  assert.equal(tracks[0].album.imageUrl, "https://p1.music.126.net/a.jpg?param=%7Bsize%7Dy%7Bsize%7D");
+  assert.equal(tracks[1].name, "B");
+  assert.deepEqual(tracks[1].artists.map(artist => artist.name), ["某人"]);
+  assert.equal(tracks[1].album.name, "某专辑");
+  assert.equal(tracks[1].duration, 0);
+});
+
+// Comments are posted through the desktop endpoint, which carries the session.
+test("postComment posts to the track thread and rejects empty or long text", async () => {
+  const sent = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    const { path, data } = decode(init.body);
+    sent.push({ path, data });
+    return response({ code: 200, comment: { commentId: 5, content: data.content, time: 1, likedCount: 2, user: { nickname: "Fixture" } } });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  const comment = await plugin.postComment({ trackId: "1", text: "  好听  " });
+  assert.equal(comment.id, "5");
+  assert.equal(comment.text, "好听");
+  assert.equal(comment.author, "Fixture");
+  assert.equal(sent[0].path, "/api/v1/resource/comments/add");
+  assert.equal(sent[0].data.threadId, "R_SO_4_1");
+  assert.equal(sent[0].data.content, "好听");
+  assert.equal(sent[0].data.t, 1);
+  await assert.rejects(plugin.postComment({ trackId: "1", text: "   " }), /不能为空/);
+  await assert.rejects(plugin.postComment({ trackId: "1", text: "字".repeat(141) }), /140/);
+});
+
+// A repeated or truncated subscription page must not hide the podcasts we have.
+test("shows keeps paging subscriptions and returns what it got", async () => {
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    const offset = Number(new URL(url).searchParams.get("offset"));
+    if (offset === 0) return response({ code: 200, count: 2, hasMore: true, djRadios: [{ id: 1, name: "A", picUrl: "http://p2.music.126.net/a.jpg" }] });
+    return response({ code: 200, count: 2, hasMore: true, djRadios: [{ id: 2, name: "B" }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  const shows = await plugin.shows();
+  assert.deepEqual(shows.map(show => show.id).sort(), ["1", "2"]);
+});
+
+// Paging is opt-in: only a host that asks with a limit gets one page.
+test("playlist pages only when the host asks with a limit", async () => {
+  const trackIds = Array.from({ length: 45 }, (_, index) => ({ id: index + 1 }));
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("playlist/detail")) return response({ code: 200, playlist: { id: 9, name: "P", trackCount: 45, creator: { userId: 1 }, trackIds } });
+    const ids = JSON.parse(decode(init.body).data.c).map(item => item.id);
+    return response({ code: 200, songs: ids.map(song), privileges: ids.map(id => ({ id, st: 0, pl: 128000 })) });
+  });
+  const whole = await plugin.playlist({ id: "9" });
+  assert.equal(whole.tracks.length, 45);
+  assert.equal(whole.more, undefined);
+  const first = await plugin.playlist({ id: "9", offset: 0, limit: 30 });
+  assert.equal(first.tracks.length, 30);
+  assert.equal(first.more, true);
+  assert.equal(first.count, 45);
+  const last = await plugin.playlist({ id: "9", offset: 30, limit: 30 });
+  assert.equal(last.tracks.length, 15);
+  assert.equal(last.more, false);
+  assert.deepEqual(last.tracks.map(track => track.id), trackIds.slice(30).map(track => String(track.id)));
+});

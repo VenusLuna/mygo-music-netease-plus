@@ -512,6 +512,14 @@ export async function browse({ page }) {
     const data = await request("/api/v1/discovery/recommend/resource");
     return { title: "个性化歌单", sections: [{ playlists: (data.recommend || []).map(toPlaylist) }] };
   }
+  if (page === "cloud") {
+    await requireAccount();
+    const tracks = await cloudTracks();
+    return {
+      title: "我的云盘", subtitle: `网易云音乐 · 云盘 ${tracks.length} 首`,
+      sections: [{ tracks, empty: "云盘里还没有歌曲，可在网易云音乐客户端上传" }],
+    };
+  }
   if (page !== "charts") throw fail("unsupported", "没有这个页面");
   const data = await request("/api/toplist/detail");
   return { title: "排行榜", sections: [{ playlists: (data.list || []).map(toPlaylist) }] };
@@ -531,16 +539,64 @@ export async function playlists() {
   }
 }
 
-export async function playlist({ id }) {
+export async function playlist({ id, offset = 0, limit }) {
   const data = await request("/api/v6/playlist/detail", { id: idOf(id), n: 1 });
   if (!data.playlist) throw fail("unavailable", "歌单不存在或当前账号无权访问");
   const source = data.playlist;
-  const ids = (source.trackIds || source.tracks || []).slice(0, PLAYLIST_LIMIT).map((track) => track.id);
+  const all = (source.trackIds || source.tracks || []).slice(0, PLAYLIST_LIMIT).map((track) => track.id);
+  // A host that pages a playlist asks for a page with `limit`; one that does
+  // not gets every song at once, exactly as before.
+  const paged = Number.isSafeInteger(limit) && limit > 0;
+  const start = paged ? pageOffset(offset) : 0;
+  const ids = paged ? all.slice(start, start + limit) : all;
   const result = toPlaylist(source);
   const tracks = await songDetails(ids, source.tracks || [], { budgetMs: PLAYLIST_BUDGET_MS });
   result.tracks = tracks.map(toTrack);
+  if (paged) {
+    result.more = start + tracks.length < all.length;
+    result.count = all.length;
+    return result;
+  }
   if (tracks.length < Math.max(source.trackCount || 0, ids.length)) {
     result.description += `\n已载入前 ${tracks.length} 首（歌单共 ${source.trackCount} 首），其余因载入时间或数量限制未显示。`;
+  }
+  return result;
+}
+
+// The listener's cloud disk: files they uploaded. NetEase returns them with
+// the catalog metadata where it matched one, and with the file's own artist and
+// album strings where it did not; both play through the same player endpoint.
+function toCloudTrack(entry) {
+  const cloud = entry.privateCloud || entry;
+  const song = entry.simpleSong || {};
+  const id = String(cloud.songId || song.id || "");
+  const file = String(cloud.song || cloud.fileName || "").replace(/\.[a-z0-9]{1,5}$/i, "");
+  const artists = Array.isArray(song.ar) && song.ar.length
+    ? song.ar.map(toArtist)
+    : (cloud.artist ? [{ id: "", name: String(cloud.artist) }] : []);
+  return {
+    id, name: song.name || file || "云盘歌曲", artists,
+    album: song.al ? toAlbum(song.al) : { id: "", name: String(cloud.album || ""), imageUrl: "" },
+    duration: song.dt || 0,
+    url: `${SITE}/song?id=${id}`,
+    unavailable: !id,
+  };
+}
+
+async function cloudTracks(limit = 500) {
+  await requireAccount();
+  const result = [];
+  const seen = new Set();
+  for (let offset = 0; offset < limit; offset += 100) {
+    const data = await request("/api/v1/cloud/get", { limit: 100, offset }, { keepSession: true });
+    const items = data.data || [];
+    for (const item of items) {
+      const track = toCloudTrack(item);
+      if (!track.id || seen.has(track.id)) continue;
+      seen.add(track.id);
+      result.push(track);
+    }
+    if (!data.hasMore || !items.length) break;
   }
   return result;
 }
@@ -549,17 +605,20 @@ export async function shows() {
   await requireAccount();
   const result = new Map();
   for (let offset = 0; offset < 2000;) {
-    const data = await request("/api/djradio/get/subed", { limit: 100, offset, total: "true" }, { keepSession: true });
+    const data = await request("/api/djradio/get/subed", { limit: 200, offset, total: "true" }, { keepSession: true });
     const items = data.djRadios || [];
-    const previousSize = result.size;
-    for (const item of items) result.set(String(item.id), { ...toShow(item), subscribed: true });
-    if (!data.hasMore) return [...result.values()];
-    if (!items.length || result.size === previousSize) {
-      throw new Error("网易云未返回完整的播客订阅列表，请稍后重试");
+    for (const item of items) {
+      if (!item || !item.id) continue;
+      result.set(String(item.id), { ...toShow(item), subscribed: true });
     }
+    const count = Number(data.count);
+    // Show what NetEase gave us rather than failing the whole page: a repeated
+    // page or a missing hasMore must not hide the subscriptions we do have.
+    if (!data.hasMore || !items.length) return [...result.values()];
+    if (Number.isFinite(count) && count > 0 && result.size >= count) return [...result.values()];
     offset += items.length;
   }
-  throw new Error("播客订阅超过本版本支持的 2000 个，暂时无法完整加载");
+  return [...result.values()];
 }
 
 export async function show({ id, offset = 0 }) {
@@ -846,6 +905,22 @@ async function loadStream(id, quality, generation) {
     gain: audio.gain || 0, peak: audio.peak || 0,
     headers: { "User-Agent": UA, Referer: `${SITE}/` },
   };
+}
+
+export async function postComment({ trackId, text }) {
+  await requireAccount();
+  const identity = trackIdentity(trackId);
+  const content = String(text || "").trim();
+  if (!content) throw new Error("评论内容不能为空");
+  if (content.length > 140) throw new Error("网易云评论最多 140 个字");
+  const data = await eapi("/api/v1/resource/comments/add", {
+    t: 1, type: 0, threadId: identity.thread, content,
+  }, { keepSession: true });
+  const comment = data.comment || data.data?.comment;
+  if (Number(data.code) !== 200 || !comment) {
+    throw new Error(data.message || data.msg || "网易云未接受这条评论，请稍后重试");
+  }
+  return toComment(comment);
 }
 
 // The host asks stationNext again as the queue runs out. These modes are

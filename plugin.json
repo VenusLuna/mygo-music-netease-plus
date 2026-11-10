@@ -1,7 +1,7 @@
 {
   "id": "netease-plus",
   "name": "网易云音乐 Plus",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "minAppVersion": "0.1.20",
   "main": "index.js",
   "playback": "stream",
@@ -24,6 +24,11 @@
       "title": "排行榜",
       "page": "charts",
       "icon": "chart"
+    },
+    {
+      "title": "我的云盘",
+      "page": "cloud",
+      "icon": "album"
     },
     {
       "title": "我喜欢的音乐",
