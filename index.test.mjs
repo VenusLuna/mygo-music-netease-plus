@@ -850,3 +850,110 @@ test("playlist pages only when the host asks with a limit", async () => {
   assert.equal(last.more, false);
   assert.deepEqual(last.tracks.map(track => track.id), trackIds.slice(30).map(track => String(track.id)));
 });
+
+// Search suggestions feed the host's search field; blank input never reaches
+// the network, duplicates collapse and the list stays short.
+test("suggest trims, deduplicates and caps keywords", async () => {
+  let requests = 0;
+  const { plugin } = await setup(async (url) => {
+    requests++;
+    assert.match(url, /\/api\/search\/suggest\/keyword\?s=/);
+    const keywords = ["周杰伦", "周杰伦", " 周杰伦晴天 ", "", ...Array.from({ length: 12 }, (_, index) => `关键词${index}`)];
+    return response({ code: 200, result: { allMatch: keywords.map((keyword) => ({ keyword })) } });
+  });
+  assert.deepEqual(await plugin.suggest({ query: "   " }), []);
+  const list = await plugin.suggest({ query: " 周杰伦 " });
+  assert.deepEqual(list, ["周杰伦", "周杰伦晴天", ...Array.from({ length: 8 }, (_, index) => `关键词${index}`)]);
+  assert.equal(requests, 1);
+});
+
+// The album page's save toggle reads isSub from the dynamic endpoint because
+// the album detail response does not carry it.
+test("album reports its save state and tolerates a failed lookup", async () => {
+  const detail = { code: 200, album: { id: 6, name: "Album", picUrl: "https://p1.music.126.net/a.jpg", artists: [{ id: 5, name: "Artist" }] }, songs: [] };
+  const saved = await setup(async (url) => url.includes("album/detail/dynamic")
+    ? response({ code: 200, isSub: true })
+    : response(detail));
+  assert.equal((await saved.plugin.album({ id: "6" })).album.saved, true);
+  const unsaved = await setup(async (url) => url.includes("album/detail/dynamic")
+    ? response({ code: 200, isSub: false })
+    : response(detail));
+  assert.equal((await unsaved.plugin.album({ id: "6" })).album.saved, false);
+  const broken = await setup(async (url) => {
+    if (url.includes("album/detail/dynamic")) throw new Error("offline");
+    return response(detail);
+  });
+  assert.equal("saved" in (await broken.plugin.album({ id: "6" })).album, false);
+});
+
+// Only the artist page's own artist carries artist.followed; nested song
+// artists must not claim a follow state.
+test("artist maps the follow state from the artist detail", async () => {
+  const { plugin } = await setup(async (url) => url.includes("artist/albums")
+    ? response({ code: 200, hotAlbums: [] })
+    : response({ code: 200, artist: { id: 5, name: "Artist", followed: true }, hotSongs: [] }));
+  const page = await plugin.artist({ id: "5" });
+  assert.equal(page.artist.following, true);
+  const guest = await setup(async (url) => url.includes("artist/albums")
+    ? response({ code: 200, hotAlbums: [] })
+    : response({ code: 200, artist: { id: 5, name: "Artist" }, hotSongs: [] }));
+  assert.equal("following" in (await guest.plugin.artist({ id: "5" })).artist, false);
+});
+
+// Follow and save are weapi writes: form fields plus the session CSRF token.
+test("followArtist and saveAlbum submit subscription writes", async () => {
+  const forms = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    forms.push([new URL(url).pathname, Object.fromEntries(new URLSearchParams(init.body))]);
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session", __csrf: "synthetic-csrf" }, profile: null });
+  await plugin.followArtist({ id: "5", on: true });
+  await plugin.followArtist({ id: "5", on: false });
+  await plugin.saveAlbum({ id: "6", on: true });
+  await plugin.saveAlbum({ id: "6", on: false });
+  assert.deepEqual(forms, [
+    ["/api/artist/sub", { artistId: "5", artistIds: "[5]", csrf_token: "synthetic-csrf" }],
+    ["/api/artist/unsub", { artistId: "5", artistIds: "[5]", csrf_token: "synthetic-csrf" }],
+    ["/api/album/sub", { id: "6", csrf_token: "synthetic-csrf" }],
+    ["/api/album/unsub", { id: "6", csrf_token: "synthetic-csrf" }],
+  ]);
+});
+
+// Saved albums page through the account's album sublist and mark every row
+// saved; hasMore wins, and count still produces a next page without it.
+test("savedAlbums pages saved albums and reports more", async () => {
+  const urls = [];
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("nuser/account/get")) return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    urls.push(url);
+    return response({ code: 200, count: 2, hasMore: true,
+      data: [{ id: 6, name: "Album", picUrl: "https://p1.music.126.net/a.jpg", publishTime: 0 }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const page = await plugin.savedAlbums({ offset: 50 });
+  const query = new URL(urls[0]).searchParams;
+  assert.equal(query.get("offset"), "50");
+  assert.equal(query.get("limit"), "50");
+  assert.equal(page.albums[0].saved, true);
+  assert.equal(page.albums[0].name, "Album");
+  assert.equal(page.more, true);
+  const first = await plugin.savedAlbums({});
+  assert.equal(new URL(urls[1]).searchParams.get("offset"), "0");
+  assert.equal(first.more, true);
+});
+
+// Guest and malformed subscription calls fail before any write request.
+test("follow, save and saved albums require sign-in and valid IDs", async () => {
+  let requests = 0;
+  const invalid = await setup(async () => { requests++; return response({ code: 200 }); });
+  await assert.rejects(invalid.plugin.followArtist({ id: "artist", on: true }), /无效/);
+  await assert.rejects(invalid.plugin.saveAlbum({ id: "0", on: true }), /无效/);
+  assert.equal(requests, 0);
+  const guest = await setup(async () => { requests++; return response({ code: 200 }); });
+  for (const action of [
+    () => guest.plugin.followArtist({ id: "5", on: true }),
+    () => guest.plugin.saveAlbum({ id: "6", on: true }),
+    () => guest.plugin.savedAlbums({ offset: 0 }),
+  ]) await assert.rejects(action(), { code: "signIn" });
+  assert.equal(requests, 0);
+});

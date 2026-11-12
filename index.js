@@ -448,6 +448,23 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   return { [kind]: records.map(type[3]), more: items.length > 0 && offset + items.length < (result[type[2]] || 0) };
 }
 
+// MyGo offers these under the search field. NetEase's keyword endpoint returns
+// the same type-1 phrases the website's own suggest list shows.
+export async function suggest({ query } = {}) {
+  const text = String(query ?? "").trim();
+  if (!text) return [];
+  const data = await request("/api/search/suggest/keyword", { s: text });
+  const matches = data?.result?.allMatch;
+  if (!Array.isArray(matches)) return [];
+  const keywords = [];
+  for (const match of matches) {
+    const keyword = String(match?.keyword ?? "").trim();
+    if (keyword && !keywords.includes(keyword)) keywords.push(keyword);
+    if (keywords.length === 10) break;
+  }
+  return keywords;
+}
+
 async function discoveryPlaylists() {
   const data = await request("/api/personalized/playlist", { limit: 24 });
   const playlists = (data.result || []).map(toPlaylist);
@@ -642,9 +659,52 @@ export async function show({ id, offset = 0 }) {
 }
 
 export async function album({ id }) {
-  const data = await request(`/api/v1/album/${idOf(id)}`);
+  id = idOf(id);
+  const [data, state] = await Promise.all([
+    request(`/api/v1/album/${id}`),
+    // The page needs the save state, and /api/v1/album does not report it.
+    // Guests get isSub: false here, so the toggle still renders signed out.
+    request("/api/album/detail/dynamic", { id }, { keepSession: true }).catch((error) => {
+      if (error.code === "signIn") throw error;
+      return null;
+    }),
+  ]);
   if (!data.album) throw fail("unavailable", "专辑不可用");
-  return { album: toAlbum(data.album), tracks: (await songDetails((data.songs || []).map((song) => song.id), data.songs || [])).map(toTrack) };
+  const record = toAlbum(data.album);
+  if (typeof state?.isSub === "boolean") record.saved = state.isSub;
+  return { album: record, tracks: (await songDetails((data.songs || []).map((song) => song.id), data.songs || [])).map(toTrack) };
+}
+
+// Follow and save are plain weapi writes, like playlist track edits: send the
+// same fields the website does and keep the CSRF token when the session has one.
+async function submitSubscription(label, path, fields) {
+  const form = new URLSearchParams(fields);
+  if (currentSession().cookies.__csrf) form.set("csrf_token", session.cookies.__csrf);
+  try {
+    await request(path, {}, { form: form.toString(), keepSession: true });
+  } catch (error) {
+    error.message = `${label}失败：${error.message}`;
+    throw error;
+  }
+}
+
+export async function saveAlbum({ id, on }) {
+  id = idOf(id);
+  await requireAccount();
+  await submitSubscription(on ? "收藏专辑" : "取消收藏专辑", `/api/album/${on ? "sub" : "unsub"}`, { id });
+}
+
+export async function savedAlbums({ offset = 0 } = {}) {
+  const start = pageOffset(offset);
+  await requireAccount();
+  const data = await request("/api/album/sublist", { limit: 50, offset: start, total: true }, { keepSession: true });
+  const items = Array.isArray(data.data) ? data.data : [];
+  const albums = items.map((album) => ({ ...toAlbum(album), saved: true }));
+  const count = Number(data.count);
+  const more = typeof data.hasMore === "boolean"
+    ? data.hasMore
+    : Number.isSafeInteger(count) && start + items.length < count;
+  return { albums, more };
 }
 
 async function artistAlbums(id) {
@@ -671,10 +731,22 @@ export async function artist({ id }) {
     request(`/api/v1/artist/${id}`), artistAlbums(id),
   ]);
   if (!detail.artist) throw fail("unavailable", "歌手不可用");
+  const record = toArtist(detail.artist);
+  // artist.followed is the artist page's own field; nested song artists do not
+  // carry it, so only the page artist reports a follow state.
+  if (typeof detail.artist.followed === "boolean") record.following = detail.artist.followed;
   return {
-    artist: toArtist(detail.artist), albums,
+    artist: record, albums,
     tracks: (await songDetails((detail.hotSongs || []).map((song) => song.id), detail.hotSongs || [])).map(toTrack),
   };
+}
+
+export async function followArtist({ id, on }) {
+  id = idOf(id);
+  await requireAccount();
+  await submitSubscription(on ? "关注歌手" : "取消关注歌手", `/api/artist/${on ? "sub" : "unsub"}`, {
+    artistId: id, artistIds: JSON.stringify([Number(id)]),
+  });
 }
 
 // The listener's own liked-songs playlist, which NetEase marks specialType 5.
